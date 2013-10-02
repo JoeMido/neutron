@@ -146,10 +146,6 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
         net = super(MidonetPluginV2, self).get_network(
             context, subnet['subnet']['network_id'], fields=None)
-        if net['subnets']:
-            raise q_exc.NotImplementedError(
-                _("MidoNet doesn't support multiple subnets "
-                  "on the same network."))
 
         session = context.session
         with session.begin(subtransactions=True):
@@ -213,55 +209,23 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                           id=bridge_id)
 
         # get dhcp subnet data from MidoNet bridge.
+        network_address, prefix = qsubnet['cidr'].split('/')
         dhcps = bridge.get_dhcp_subnets()
-        b_network_address = dhcps[0].get_subnet_prefix()
-        b_prefix = dhcps[0].get_subnet_length()
+        found = False
+        for dhcp in dhcps:
+            b_network_address = dhcp.get_subnet_prefix()
+            b_prefix = dhcp.get_subnet_length()
+            if network_address == b_network_address or int(prefix) == b_prefix:
+                found = True
+                break
 
         # Validate against quantum database.
-        network_address, prefix = qsubnet['cidr'].split('/')
-        if network_address != b_network_address or int(prefix) != b_prefix:
+        if found is False:
             raise MidonetResourceNotFound(resource_type='DhcpSubnet',
                                           id=qsubnet['cidr'])
 
         LOG.debug(_("MidonetPluginV2.get_subnet exiting: qsubnet=%s"), qsubnet)
         return qsubnet
-
-    def get_subnets(self, context, filters=None, fields=None):
-        """List Quantum subnets.
-
-        Retrieves Quantum subnets with some fields populated by the data
-        stored in MidoNet.
-        """
-        LOG.debug(_("MidonetPluginV2.get_subnets called: filters=%(filters)r, "
-                    "fields=%(fields)r"),
-                  {'filters': filters, 'fields': fields})
-        subnets = super(MidonetPluginV2, self).get_subnets(context, filters,
-                                                           fields)
-        for sn in subnets:
-            if not 'network_id' in sn:
-                continue
-            try:
-                bridge = self.mido_api.get_bridge(sn['network_id'])
-            except w_exc.HTTPNotFound:
-                raise MidonetResourceNotFound(resource_type='Bridge',
-                                              id=sn['network_id'])
-
-            # TODO(tomoe): dedupe this part.
-            # get dhcp subnet data from MidoNet bridge.
-            dhcps = bridge.get_dhcp_subnets()
-            b_network_address = dhcps[0].get_subnet_prefix()
-            b_prefix = dhcps[0].get_subnet_length()
-
-            # Validate against quantum database.
-            if sn.get('cidr'):
-                network_address, prefix = sn['cidr'].split('/')
-                if network_address != b_network_address or int(
-                        prefix) != b_prefix:
-                        raise MidonetResourceNotFound(
-                            resource_type='DhcpSubnet', id=sn['cidr'])
-
-        LOG.debug(_("MidonetPluginV2.create_subnet exiting"))
-        return subnets
 
     def delete_subnet(self, context, id):
         """Delete Quantum subnet.
@@ -287,8 +251,11 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                 raise MidonetResourceNotFound(resource_type='Bridge',
                                               id=bridge_id)
 
-            dhcp = bridge.get_dhcp_subnets()
-            dhcp[0].delete()
+            dhcps = bridge.get_dhcp_subnets()
+            for dhcp in dhcps:
+                if dhcp.get_subnet_prefix() == subnet['cidr']:
+                    dhcp.delete()
+                    break
 
             # If the network is external, clean up routes, links, ports.
             self._extend_network_dict_l3(context, net)
