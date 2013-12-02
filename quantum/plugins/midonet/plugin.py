@@ -177,18 +177,22 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                 pr_port = in_port.port_address(gateway_ip).network_address(
                     network_address).network_length(length).create()
 
-                # create a interior port in the bridge, then link
-                # it to the provider router.
+                # create a interior port in the bridge...
                 br_port = bridge.add_interior_port().create()
+
+                # ...then link it to the provider router
                 pr_port.link(br_port.get_id())
 
-                # add a route for the subnet in the provider router
+                # add a route for the subnet in the provider router. The
+                # traffic is BlackHoled because only legitimate traffic
+                # should be forwarded, which will have a route explicitly
+                # added when the IP is allocated.
                 self._get_provider_router().add_route().type(
-                    'Normal').src_network_addr('0.0.0.0').src_network_length(
+                    'BlackHole').src_network_addr(
+                    '0.0.0.0').src_network_length(
                     0).dst_network_addr(
                     network_address).dst_network_length(
-                    length).weight(100).next_hop_port(
-                    pr_port.get_id()).create()
+                    length).weight(100).create()
 
         LOG.debug(_("MidonetPluginV2.create_subnet exiting: sn_entry=%r"),
                   sn_entry)
@@ -263,8 +267,9 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                     if p.get_device_id() == bridge.get_id():
                         bridge_ports_to_delete.append(p)
 
+                pr_router = self._get_provider_router()
                 for p in bridge.get_peer_ports():
-                    if p.get_device_id() == self._get_provider_router().get_id():
+                    if p.get_device_id() == pr_router.get_id():
                         # delete the routes going to the brdge
                         for r in routes:
                             if r.get_next_hop_port() == p.get_id():
@@ -430,6 +435,28 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                       self).create_port(context, port)
                 self._extend_port_dict_security_group(context, port_db_entry)
                 fixed_ip = port_db_entry['fixed_ips'][0]['ip_address']
+                net = super(MidonetPluginV2, self).get_network(context,
+                                                               port_data[
+                                                               'network_id'],
+                                                               fields=None)
+                self._extend_network_dict_l3(context, net)
+                if (net['router:external'] and
+                    (device_owner.startswith('compute:')
+                        or device_owner is '')):
+                    pr_router = self._get_provider_router()
+                    for p in bridge.get_peer_ports():
+                        if p.get_device_id() == pr_router.get_id():
+                            pr_port = p
+                    # Add a route for this IP since the default action for
+                    # traffic to this subnet is to be dropped.
+                    for ip in port_db_entry['fixed_ips']:
+                        self._get_provider_router().add_route().type(
+                        'Normal').src_network_addr(
+                        '0.0.0.0').src_network_length(
+                        0).dst_network_addr(
+                        ip['ip_address']).dst_network_length(
+                        32).weight(100).next_hop_port(
+                        pr_port.get_id()).create()
 
         if port_db_entry:
             if is_compute_interface:
@@ -525,8 +552,23 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                     dhcp_subnets = bridge.get_dhcp_subnets()
                     if dhcp_subnets:
                         for dh in dhcp_subnets[0].get_dhcp_hosts():
-                            if dh.get_mac_addr() == mac and dh.get_ip_addr() == ip:
+                            if (dh.get_mac_addr() == mac and
+                                dh.get_ip_addr() == ip):
                                 dh.delete()
+                    # if the network is external, then the route for this ip
+                    # needs to be removed because it was explicitly added.
+                    net = super(MidonetPluginV2,
+                                self).get_network(context,
+                                                  port_db_entry[
+                                                  'network_id'],
+                                                  fields=None)
+                    self._extend_network_dict_l3(context, net)
+                    if net['router:external']:
+                        pr_router = self._get_provider_router()
+                        for r in pr_router.get_routes():
+                            if (r.get_dst_network_addr() == ip and
+                                    r.get_dst_network_length() == 32):
+                                r.delete()
 
                 result = super(MidonetPluginV2, self).delete_port(context, id)
                 self.mido_api.get_port(id).delete()
@@ -881,13 +923,13 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
     def _update_fip_assoc(self, context, fip, floatingip_db, external_port):
         LOG.debug(_("MidonetPluginV2._update_fip_assoc called: fip=%(fip)s"
                     "floatingip_db=%(floatingip_db)s, "
-                    "external_port=%(external_port)s"), 
-                  {'fip': fip, 'floatingip_db': floatingip_db, 
+                    "external_port=%(external_port)s"),
+                  {'fip': fip, 'floatingip_db': floatingip_db,
                    'external_port': external_port})
 
         session = context.session
         with session.begin(subtransactions=True):
-            super(MidonetPluginV2, self)._update_fip_assoc(context, fip, 
+            super(MidonetPluginV2, self)._update_fip_assoc(context, fip,
                 floatingip_db, external_port)
 
             tenant_id = fip['tenant_id']
@@ -899,14 +941,15 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                    context,
                    fip,
                    floatingip_db['floating_network_id'])
-    
+
                 fixed_address = internal_ip_address
 
                 tenant_router = self.mido_api.get_router(router_id)
                 # find the provider router port that is connected to the tenant
                 # of the floating ip
+                pr_router = self._get_provider_router()
                 for p in tenant_router.get_peer_ports():
-                    if p.get_device_id() == self._get_provider_router().get_id():
+                    if p.get_device_id() == pr_router.get_id():
                         pr_port = p
 
                 # get the tenant router port id connected to provider router
