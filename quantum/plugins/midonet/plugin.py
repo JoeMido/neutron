@@ -929,12 +929,12 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         floating_address = floatingip_db['floating_ip_address']
         id = floatingip_db['id']
         with session.begin(subtransactions=True):
-            super(MidonetPluginV2, self)._update_fip_assoc(context, fip, 
-                floatingip_db, external_port)
-
 
             # Clear the old association if there is one.
             self._clear_midonet_fip_assoc(context, tenant_id, floatingip_db)
+
+            super(MidonetPluginV2, self)._update_fip_assoc(context, fip,
+                floatingip_db, external_port)
 
             if 'port_id' in fip and fip['port_id']:
                 port_id, internal_ip_address, router_id = self.get_assoc_data(
