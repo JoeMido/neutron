@@ -701,20 +701,20 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
               router['router']['external_gateway_info'] == {}):
             op_gateway_clear = True
 
-        # Get the router's gateway port and its IP address.
-        qports = super(MidonetPluginV2, self).get_ports(
-            context, {'device_id': [id],
-                      'device_owner': ['network:router_gateway']})
-
-        assert len(qports) == 1
-        qport = qports[0]
-        snat_ip = qport['fixed_ips'][0]['ip_address']
 
         session = context.session
         with session.begin(subtransactions=True):
 
             qrouter = super(MidonetPluginV2, self).update_router(context, id,
                                                                  router)
+
+            # Get the router's gateway port and its IP address.
+            qports = super(MidonetPluginV2, self).get_ports(
+                context, {'device_id': [id],
+                          'device_owner': ['network:router_gateway']})
+            assert len(qports) == 1
+            qport = qports[0]
+            snat_ip = qport['fixed_ips'][0]['ip_address']
 
             changed_name = router['router'].get('name')
             if changed_name:
