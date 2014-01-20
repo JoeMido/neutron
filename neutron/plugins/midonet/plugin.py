@@ -51,6 +51,7 @@ from neutron.openstack.common import rpc
 from neutron.plugins.midonet.common import config  # noqa
 from neutron.plugins.midonet.common import net_util
 from neutron.plugins.midonet import midonet_lib
+import time
 
 LOG = logging.getLogger(__name__)
 
@@ -201,6 +202,12 @@ class MidoRpcCallbacks(dhcp_rpc_base.DhcpRpcCallbackMixin):
         """
         return n_rpc.PluginRpcDispatcher([self,
                                           agents_db.AgentExtRpcCallback()])
+
+
+# Exception to indicate that an operation has timed out
+class RetryError(Exception):
+    #message = _("%(msg)s")
+    pass
 
 
 class MidonetPluginException(n_exc.NeutronException):
@@ -1170,6 +1177,47 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         self.client.delete_port_routes(routes, bridge_port.get_peer_id())
         self.client.unlink(bridge_port)
 
+    # generator for retries. Will stop giving output when either the
+    # timeout has been passed or the number of attempts has been passed
+    def retryloop(self, attempts, timeout, delay=1, backoff=1):
+        starttime = time.time()
+        sleeptime = delay
+        success = set()
+        for i in range(attempts):
+            success.add(True)
+            yield success.clear
+            # if the timeout has passed, or the next sleep will go over
+            # the timeout, we are done.
+            if time.time() > starttime - sleeptime + timeout:
+                break
+            # the output has not been called, so we succeeded.
+            if success:
+                return
+            time.sleep(sleeptime)
+            sleeptime *= backoff
+        raise RetryError
+
+    def _get_metadata_gw_ip(self, context, subnet):
+        # getting the metadata gw ip will generally succeed on the first try.
+        # However, there is a corner case where the subnet may be created
+        # and have a router interface connected before the dhcp port has
+        # been created on the subnet, requiring a retry.
+        metadata_gw_ip = None
+        try:
+            for retry in self.retryloop(10, 5):
+                rport_qry = context.session.query(models_v2.Port)
+                dhcp_ports = rport_qry.filter_by(
+                    network_id=subnet["network_id"],
+                    device_owner='network:dhcp').all()
+                if dhcp_ports and dhcp_ports[0].fixed_ips:
+                    metadata_gw_ip = dhcp_ports[0].fixed_ips[0].ip_address
+                else:
+                    retry()
+        except RetryError:
+            LOG.warn(_("DHCP agent is not working correctly. No port "
+                       "to reach the Metadata server on this network"))
+        return metadata_gw_ip
+
     def add_router_interface(self, context, router_id, interface_info):
         """Handle router linking with network."""
         LOG.debug(_("MidonetPluginV2.add_router_interface called: "
@@ -1188,16 +1236,8 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             router = self.client.get_router(router_id)
 
             # Get the metadata GW IP
-            metadata_gw_ip = None
-            rport_qry = context.session.query(models_v2.Port)
-            dhcp_ports = rport_qry.filter_by(
-                network_id=subnet["network_id"],
-                device_owner='network:dhcp').all()
-            if dhcp_ports and dhcp_ports[0].fixed_ips:
-                metadata_gw_ip = dhcp_ports[0].fixed_ips[0].ip_address
-            else:
-                LOG.warn(_("DHCP agent is not working correctly. No port "
-                           "to reach the Metadata server on this network"))
+            metadata_gw_ip = self._get_metadata_gw_ip(context, subnet)
+
             # Link the router and the bridge
             port = super(MidonetPluginV2, self).get_port(context,
                                                          info["port_id"])
