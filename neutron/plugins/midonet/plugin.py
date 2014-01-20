@@ -51,6 +51,7 @@ from neutron.openstack.common import rpc
 from neutron.plugins.midonet.common import config  # noqa
 from neutron.plugins.midonet.common import net_util
 from neutron.plugins.midonet import midonet_lib
+import time
 
 LOG = logging.getLogger(__name__)
 
@@ -1170,6 +1171,31 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         self.client.delete_port_routes(routes, bridge_port.get_peer_id())
         self.client.unlink(bridge_port)
 
+    # Use as a decorator to retry
+    def retryloop(attempts, delay):
+        def internal_wrapper(func):
+            def retry(*args, **kwargs):
+                for i in range(attempts):
+                    result = func(*args, **kwargs)
+                    if result is None:
+                        time.sleep(delay)
+                    else:
+                        return result
+                return None
+            return retry
+        return internal_wrapper
+
+    @retryloop(5, 1)
+    def _get_dhcp_port_ip(self, context, subnet):
+        rport_qry = context.session.query(models_v2.Port)
+        dhcp_ports = rport_qry.filter_by(
+            network_id=subnet["network_id"],
+            device_owner='network:dhcp').all()
+        if dhcp_ports and dhcp_ports[0].fixed_ips:
+            return dhcp_ports[0].fixed_ips[0].ip_address
+        else:
+            return None
+
     def add_router_interface(self, context, router_id, interface_info):
         """Handle router linking with network."""
         LOG.debug(_("MidonetPluginV2.add_router_interface called: "
@@ -1188,16 +1214,8 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             router = self.client.get_router(router_id)
 
             # Get the metadata GW IP
-            metadata_gw_ip = None
-            rport_qry = context.session.query(models_v2.Port)
-            dhcp_ports = rport_qry.filter_by(
-                network_id=subnet["network_id"],
-                device_owner='network:dhcp').all()
-            if dhcp_ports and dhcp_ports[0].fixed_ips:
-                metadata_gw_ip = dhcp_ports[0].fixed_ips[0].ip_address
-            else:
-                LOG.warn(_("DHCP agent is not working correctly. No port "
-                           "to reach the Metadata server on this network"))
+            metadata_gw_ip = self._get_dhcp_port_ip(context, subnet)
+
             # Link the router and the bridge
             port = super(MidonetPluginV2, self).get_port(context,
                                                          info["port_id"])
