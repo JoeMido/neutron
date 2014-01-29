@@ -24,7 +24,8 @@
 
 from midonetclient import api
 from oslo.config import cfg
-from sqlalchemy.orm import exc as sa_exc
+from sqlalchemy import exc as sa_exc
+from sqlalchemy.orm import exc as sao_exc
 
 from neutron.api.v2 import attributes
 from neutron.common import constants
@@ -863,6 +864,45 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
 
         return p
 
+    def repair_database(self):
+        """Repair the neutron database.
+
+        Our plugin requires that the routers table have the enable_snat column,
+        however it will not be added when migrating from grizzly to havana.
+        This is because the migration scripts that update the neutron database
+        do not include this column for the midonet plugin. This function allows
+        us to update it on the fly.
+        """
+        session = db.get_session()
+        session.execute('alter table routers add column enable_snat bool')
+        session.execute('UPDATE routers SET enable_snat=True')
+
+    def get_routers_count(self, context, filters=None):
+        try:
+            return super(MidonetPluginV2, self).get_routers_count(context,
+                                                                  filters)
+        except sa_exc.OperationalError:
+            # just try again after updating the database.
+            self.repair_database()
+            return super(MidonetPluginV2, self).get_routers_count(context,
+                                                                  filters)
+
+    def get_routers(self, context, filters=None, fields=None,
+                    sorts=None, limit=None, marker=None,
+                    page_reverse=False):
+        try:
+            return super(MidonetPluginV2, self).get_routers(context, filters,
+                                                            fields, sorts,
+                                                            limit, marker,
+                                                            page_reverse)
+        except sa_exc.OperationalError:
+            self.repair_database()
+            # just try again after updating the database.
+            return super(MidonetPluginV2, self).get_routers(context, filters,
+                                                            fields, sorts,
+                                                            limit, marker,
+                                                            page_reverse)
+
     def create_router(self, context, router):
         """Handle router creation.
 
@@ -1334,7 +1374,7 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             fip_db = fip_qry.filter_by(fixed_port_id=port_id).one()
             if fip_db and fip_db['fixed_port_id']:
                 self._disassoc_fip(fip_db)
-        except sa_exc.NoResultFound:
+        except sao_exc.NoResultFound:
             pass
 
         super(MidonetPluginV2, self).disassociate_floatingips(context, port_id)
