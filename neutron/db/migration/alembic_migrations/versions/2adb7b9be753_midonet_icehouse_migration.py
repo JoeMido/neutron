@@ -41,7 +41,8 @@ def upgrade(active_plugins=None, options=None):
     if not migration.should_run(active_plugins, migration_for_plugins):
         return
 
-    op.add_column('routers', sa.Column('enable_snat', sa.Boolean(), nullable=False))
+    op.add_column('routers', sa.Column('enable_snat', sa.Boolean(),
+                  nullable=False))
 
     op.create_table(
         'quotas',
